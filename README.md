@@ -1,4 +1,4 @@
-# 🚀 POPOLO Agent
+# POPOLO Agent
 > **GitHub 데이터를 기반으로 포트폴리오를 자동 생성하는 AI 에이전트**
 
 ## 🛠 Tech Stack
