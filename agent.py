@@ -19,7 +19,7 @@ class PortfolioAgent:
         api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
         llm_kwargs = {
-            "model": "gemini-2.5-flash",
+            "model": "gemini-1.5-pro",
             "temperature": 0,
         }
         # 키가 설정된 경우에만 명시적으로 전달 (None이면 라이브러리의 기본 env 탐색에 맡김)
