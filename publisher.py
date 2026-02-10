@@ -22,7 +22,7 @@ def assemble_full_portfolio(overview: str, gallery_table: str, project_sections:
     content = "\n\n".join(project_sections)
     return f"{HEADER}\n{overview}\n\n{gallery_table}\n\n{content}\n{FOOTER}"
 
-async def save_to_file(content: str, filename: str="README.md"):
+async def save_to_file(content: str, filename: str="PORTFOLIO.md"):
     # 로컬 파일로 저장 (임시)
     with open(filename, "w", encoding="utf-8") as f:
         f.write(content)

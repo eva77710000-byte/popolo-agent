@@ -180,7 +180,7 @@ async def process_data_pipeline(selected_repos: list, response_url: str):
             await save_to_file(final_portfolio)
             await client.post(response_url, json={
                 "replace_original": False,
-                "text": "🚀 *포트폴리오 생성이 완료되었습니다!* \n프로젝트 루트의 `README.md`를 확인하세요.",
+                "text": "🚀 *포트폴리오 생성이 완료되었습니다!* \n프로젝트 루트의 `PORTFOLIO.md`를 확인하세요.",
             })
         except Exception as e:
             print(f"❌ 조립/전송 단계 에러: {e}")
