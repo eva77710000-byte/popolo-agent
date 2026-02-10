@@ -119,9 +119,20 @@ async def process_data_pipeline(selected_repos: list, response_url: str):
 
         project_analyses = []
         gallery_infos = []
+        
+        await client.post(response_url, json={
+            "replace_original": False, 
+            "text": f"🚀 *{len(selected_repos)}개* 리포지토리에 대한 분석을 시작합니다."
+        })
 
         for repo_name in selected_repos:
             try:
+                # 개별 리포지토리 분석 중 알림
+                await client.post(response_url, json={
+                    "replace_original": False,
+                    "text": f"🔍 *{repo_name}* 분석 중... "
+                })
+
                 # 1. 데이터 수집
                 raw_commits, raw_readme = await fetch_user_raw_data(client, repo_name, user_id)
                 modified_paths = await fetch_user_modified_file_paths(client, repo_name, user_id)
@@ -141,9 +152,15 @@ async def process_data_pipeline(selected_repos: list, response_url: str):
                     "stack": meta.get("stack", "N/A"),
                     "summary": meta.get("summary", "N/A")
                 })
-                print(f"✅ {repo_name} 분석 완료")
+                
+                # 개별 리포지토리 분석 완료 알림
+                await client.post(response_url, json={
+                    "replace_original": False,
+                    "text": f"✅ *{repo_name}* 분석 완료! (스택: `{meta.get('stack', 'N/A')}`)"
+                })
+
             except Exception as e:
-                print(f"⚠️ {repo_name} 처리 중 에러: {e}")
+                await client.post(response_url, json={"text": f"⚠️ {repo_name} 분석 중 오류: {e}"})
                 continue
 
         # 5. 최종 조립 및 전송 (이 구간이 실행되지 않았던 것)
