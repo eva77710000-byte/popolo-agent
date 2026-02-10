@@ -88,16 +88,6 @@ async def fetch_user_modified_file_paths(client: httpx.AsyncClient, repo_full_na
 # ---------------------------------------------------------
 # [Data Preprocessing]
 # ---------------------------------------------------------
-def preprocess_commits(commits):
-    """원본 커밋 리스트를 AI 분석용 텍스트로 정제합니다."""
-    return "\n".join([f"- {c['commit']['message']} ({c['commit']['author']['date']})" for c in commits])
-
-def preprocess_readme(readme_data):
-    """Base64 README 데이터를 디코딩하고 텍스트를 최적화합니다."""
-    if not readme_data: return ""
-    content = base64.b64decode(readme_data.get('content', '')).decode('utf-8', errors='ignore')
-    return content[:2000]
-
 async def extract_user_core_code(client: httpx.AsyncClient, repo_full_name: str, file_paths: list):
     """수정된 파일 중 핵심 로직을 선별하여 내용을 추출합니다."""
     target_exts = [".py", ".js", ".ts", ".java", ".go"]
@@ -118,85 +108,66 @@ async def extract_user_core_code(client: httpx.AsyncClient, repo_full_name: str,
     
     return "\n".join(code_segments)
 
-
-async def process_data_pipeline(selected_repos: list[str], response_url: str):
-    """
-    선택된 리포지토리들에 대해 GitHub 데이터를 수집하고,
-    LangChain 기반 포트폴리오 에이전트로 분석한 뒤,
-    최종 포트폴리오 마크다운을 생성·저장합니다.
-    """
-    if not selected_repos:
-        return
-
+async def process_data_pipeline(selected_repos: list, response_url: str):
+    """실제로 작동하는 전체 분석 및 결과 전송 로직"""
     agent = PortfolioAgent()
-    project_summaries: list[str] = []
-    gallery_repos_info: list[dict] = []
-
     async with httpx.AsyncClient() as client:
         user_id = await get_user_id(client)
-        if not user_id:
-            await client.post(
-                response_url,
-                json={"replace_original": False, "text": "🚫 GitHub 사용자 정보를 가져오지 못했습니다. 토큰을 확인해주세요."},
-            )
+        if not user_id: 
+            await client.post(response_url, json={"text": "🚫 GitHub ID 조회 실패"})
             return
 
-        for repo_full_name in selected_repos:
-            # 1) 원본 데이터 수집
-            commits, readme = await fetch_user_raw_data(client, repo_full_name, user_id)
-            file_paths = await fetch_user_modified_file_paths(client, repo_full_name, user_id)
-            core_code = await extract_user_core_code(client, repo_full_name, file_paths)
+        project_analyses = []
+        gallery_infos = []
 
-            # 2) 전처리
-            commits_text = preprocess_commits(commits)
-            readme_text = preprocess_readme(readme)
+        for repo_name in selected_repos:
+            try:
+                # 1. 데이터 수집
+                raw_commits, raw_readme = await fetch_user_raw_data(client, repo_name, user_id)
+                modified_paths = await fetch_user_modified_file_paths(client, repo_name, user_id)
+                core_code = await extract_user_core_code(client, repo_name, modified_paths)
+                
+                # 2. 전처리 (agent.py로 이관된 로직 호출)
+                combined_context = agent.preprocess_context(raw_commits, raw_readme, core_code)
+                
+                # 3. AI 상세 분석
+                analysis_result = await agent.run_analysis(combined_context, repo_name)
+                project_analyses.append(analysis_result)
+                
+                # 4. 메타데이터 추출 (갤러리용)
+                meta = await agent.extract_project_meta(analysis_result)
+                gallery_infos.append({
+                    "name": repo_name,
+                    "stack": meta.get("stack", "N/A"),
+                    "summary": meta.get("summary", "N/A")
+                })
+                print(f"✅ {repo_name} 분석 완료")
+            except Exception as e:
+                print(f"⚠️ {repo_name} 처리 중 에러: {e}")
+                continue
 
-            context = (
-                f"### Repository: {repo_full_name}\n\n"
-                f"## README (trimmed)\n{readme_text}\n\n"
-                f"## Commit History\n{commits_text}\n\n"
-                f"## Core Code Snippets\n{core_code}\n"
+        # 5. 최종 조립 및 전송 (이 구간이 실행되지 않았던 것)
+        try:
+            # 전체 요약 생성
+            technical_overview = await agent.run_total_summary(project_analyses)
+            
+            # 갤러리 테이블 및 포트폴리오 조립
+            gallery_table = build_gallery_table(gallery_infos)
+            final_portfolio = assemble_full_portfolio(
+                overview=technical_overview,
+                gallery_table=gallery_table,
+                project_sections=project_analyses
             )
-
-            # 3) 개별 프로젝트 분석
-            project_summary = await agent.run_analysis(context=context, project_name=repo_full_name)
-            project_summaries.append(project_summary)
-
-            # 갤러리용 메타 정보 (간단 추출)
-            first_line = project_summary.splitlines()[0] if project_summary else repo_full_name
-            gallery_repos_info.append(
-                {
-                    "name": repo_full_name,
-                    "stack": "Auto-detected",  # TODO: LLM 결과에서 스택 추출
-                    "summary": first_line[:120],
-                }
-            )
-
-    if not project_summaries:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                response_url,
-                json={"replace_original": False, "text": "⚠️ 분석 가능한 프로젝트 데이터가 없습니다."},
-            )
-        return
-
-    # 4) 전체 요약 및 포트폴리오 조립
-    overview = await agent.run_total_summary(project_summaries)
-    gallery_table = build_gallery_table(gallery_repos_info)
-    full_portfolio_md = assemble_full_portfolio(overview, gallery_table, project_summaries)
-
-    # 5) 로컬 파일로 저장
-    await save_to_file(full_portfolio_md, filename="PORTFOLIO.md")
-
-    # 6) 슬랙 알림
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            response_url,
-            json={
-                "replace_original": True,
-                "text": "✅ 선택한 리포지토리 기반 포트폴리오 분석이 완료되었습니다.\n로컬 파일 `PORTFOLIO.md`로 저장되었습니다.",
-            },
-        )
+            
+            # 파일 저장 및 슬랙 알림
+            await save_to_file(final_portfolio)
+            await client.post(response_url, json={
+                "replace_original": False,
+                "text": "🚀 *포트폴리오 생성이 완료되었습니다!* \n프로젝트 루트의 `README.md`를 확인하세요.",
+            })
+        except Exception as e:
+            print(f"❌ 조립/전송 단계 에러: {e}")
+            await client.post(response_url, json={"text": f"❌ 포트폴리오 조립 중 에러 발생: {e}"})
 
 # ---------------------------------------------------------
 # [Slack Interaction Handler]
