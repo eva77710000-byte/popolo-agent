@@ -2,6 +2,7 @@ import json
 import os
 import base64
 import httpx
+import re
 from fastapi import FastAPI, Request, BackgroundTasks
 from dotenv import load_dotenv
 
@@ -18,7 +19,7 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------
-# [Data Ingection]
+# [Data Ingestion]
 # ---------------------------------------------------------
 async def fetch_readme_content(client: httpx.AsyncClient, repo_full_name: str) -> str:
     # 리포지토리 README.md를 수집 및 디코딩
@@ -50,38 +51,55 @@ async def fetch_all_author_commits(client: httpx.AsyncClient, repo_full_name: st
         page+=1
     return commit_messages
 
-async def collect_selected_repo_contents(repo_full_names: list, response_url: str):
-    # 사용자가 선택한 리포지토리들의 데이터를 통합 수집
-    async with httpx.AsyncClient() as client:
-        collected_data = []
-        missing_readme = []
-        
-        for full_name in repo_full_names:
-            # README 수집
-            readme_text = await fetch_readme_content(client, full_name)
-            if not readme_text:
-                missing_readme.append(full_name)
-            # 커밋 메세지 수집
-            commit_logs = await fetch_all_author_commits(client, full_name)
+# ---------------------------------------------------------
+# [Data Preprocessing]
+# ---------------------------------------------------------
+# Noise Filtering
+def filter_noise_msg(messages: list) -> list:
+    noise_patterns = [
+        r"^Merge branch.*", r"^Update README.*", r"^Initial commit.*",
+        r"^fix typo.*", r"^cleanup.*", r"^\."
+    ]
+    return [
+        msg.strip() for msg in messages 
+        if not any(re.match(pattern, msg, re.IGNORECASE) for pattern in noise_patterns)
+    ]
 
-            collected_data.append({
-                "repo": full_name,
-                "readme": readme_text,
-                "raw_commits": commit_logs
-            })
-        # README가 없는 리포지토리 알림
-        if missing_readme:
-            warning_text = "\n".join([f"⚠️ `{repo}` README.md 없음" for repo in missing_readme])
-            await client.port(response_url, json={
-                "replace_original": False,
-                "text": f"알림: 일부 리포지토리의 설명 데이터가 부족할 수 있습니다. \n{warning_text}"
-            })
-        # 수집 완료 알림
+# Token Optimization
+def optimize_content_size(readme: str, messages: list) -> tuple:
+    # README 상위 2000자, 커밋 최신 50개 제한
+    opt_readme = readme[:2000]
+    opt_msg = messages[:50]
+    return opt_readme, opt_msg
+
+# Text Structuring
+def structure_for_llm(repo_name: str, readme: str, messages: list) -> str:
+    # 단일 테스트로 변환
+    commit_str = "\n".join([f"- {m}" for m in messages])
+    return f"### Project: {repo_name}\n\n[README Snippet]\n{readme}\n\n[Key Commits]\n{commit_str}"
+
+# 데이터 수집 및 전처리 통합
+async def process_data_pipeline(repo_full_names: list, response_url: str):
+    async with httpx.AsyncClient() as client:
+        final_contexts=[]
+
+        for full_name in repo_full_names:
+            # 수집
+            raw_readme = await fetch_readme_content(client, full_name)
+            raw_commits = await fetch_all_author_commits(client, full_name)
+
+            # 전처리
+            filtered_commits = filter_noise_msg(raw_commits)
+            clean_readme, clean_commits = optimize_content_size(raw_readme, filtered_commits)
+            formatted_text = structure_for_llm(full_name, clean_readme, clean_commits)
+
+            final_contexts.append(formatted_text)
+
+        # 결과 전송
         await client.post(response_url, json={
             "replace_original": False,
-            "text": f"✅ 데이터 수집 완료 "
+            "text": f"✅ AI 분석 단계를 시작합니다."
         })
-
 # ---------------------------------------------------------
 # [Slack Interaction Handler]
 # ---------------------------------------------------------
