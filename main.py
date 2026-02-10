@@ -17,6 +17,74 @@ HEADERS = {
     "Accept": "application/vnd.github.v3+json"
 }
 
+# ---------------------------------------------------------
+# [Data Ingection]
+# ---------------------------------------------------------
+async def fetch_readme_content(client: httpx.AsyncClient, repo_full_name: str) -> str:
+    # 리포지토리 README.md를 수집 및 디코딩
+    url = f"https://api.github.com/repos/{repo_full_name}/readme"
+    res = await client.get(url, headers=HEADERS)
+
+    if res.status_code == 200:
+        content_b64 = res.json().get("content", "")
+        return base64.b64decode(content_b64).decode('utf-8')
+
+    return ""
+
+async def fetch_all_author_commits(client: httpx.AsyncClient, repo_full_name: str) -> list:
+    # 리포지토리에서 사용자가 작성한 모든 커밋 메세지 수집
+    commit_messages = []
+    page = 1
+    while page <=3:
+        url = f"https://api.github.com/repos/{repo_full_name}/commits?per_page=100&page={page}"
+        res = await client.get(url, headers=HEADERS)
+        if res.status_code != 200:
+            break
+        commits = res.json()
+        if not commits:
+            break
+        for c in commits:
+            msg = c.get("commit", {}).get("message", "")
+            if msg:
+                commit_messages.append(msg)
+        page+=1
+    return commit_messages
+
+async def collect_selected_repo_contents(repo_full_names: list, response_url: str):
+    # 사용자가 선택한 리포지토리들의 데이터를 통합 수집
+    async with httpx.AsyncClient() as client:
+        collected_data = []
+        missing_readme = []
+        
+        for full_name in repo_full_names:
+            # README 수집
+            readme_text = await fetch_readme_content(client, full_name)
+            if not readme_text:
+                missing_readme.append(full_name)
+            # 커밋 메세지 수집
+            commit_logs = await fetch_all_author_commits(client, full_name)
+
+            collected_data.append({
+                "repo": full_name,
+                "readme": readme_text,
+                "raw_commits": commit_logs
+            })
+        # README가 없는 리포지토리 알림
+        if missing_readme:
+            warning_text = "\n".join([f"⚠️ `{repo}` README.md 없음" for repo in missing_readme])
+            await client.port(response_url, json={
+                "replace_original": False,
+                "text": f"알림: 일부 리포지토리의 설명 데이터가 부족할 수 있습니다. \n{warning_text}"
+            })
+        # 수집 완료 알림
+        await client.post(response_url, json={
+            "replace_original": False,
+            "text": f"✅ 데이터 수집 완료 "
+        })
+
+# ---------------------------------------------------------
+# [Slack Interaction Handler]
+# ---------------------------------------------------------
 @app.post("/slack/command")
 async def handle_slack_command(request: Request, background_tasks: BackgroundTasks):
     form_data = await request.form()
@@ -48,9 +116,9 @@ async def handle_slack_interactive(request: Request, background_tasks: Backgroun
 
     return ""
 
-# 통합 데이터 수집 및 업데이트
+# 리포지토리 목록 호출
 async def fetch_all_integrated_repos(response_url: str):
-    # affiliation 파라미터를 통해 개인+조직 리포지토리를 한 번에 쿼리합니다.
+    # 개인+조직 리포지토리를 한 번에 쿼리
     api_url = "https://api.github.com/user/repos?sort=updated&per_page=30&affiliation=owner,collaborator,organization_member"
     
     async with httpx.AsyncClient() as client:
@@ -89,47 +157,3 @@ async def fetch_all_integrated_repos(response_url: str):
             ]
         }
         await client.post(response_url, json=update_payload)
-
-async def collect_selected_repo_contents(repo_full_names: list, response_url: str):
-    # 선택된 리포지토리들로부터 핵심 데이터(README, Commit)를 긁어옵니다.
-    async with httpx.AsyncClient() as client:
-        # 이 단계에서 수집된 데이터는 이후 AI Agent(M2)의 입력값이 됩니다.
-        collected_data = []
-        for full_name in repo_full_names:
-            print(f"\n{'='*20} 분석 시작: {full_name} {'='*20}") # 개발자 확인용
-
-            # 1. README 수집 (Base64 디코딩 포함)
-            readme_res = await client.get(f"https://api.github.com/repos/{full_name}/readme", headers=HEADERS)
-            content = ""
-            if readme_res.status_code == 200:
-                readme_content_b64 = readme_res.json().get("content", "")
-                readme_text = base64.b64decode(readme_content_b64).decode('utf-8')
-                
-                print(f"[DEBUG] README 데이터 (상위 200자):\n{readme_text[:200]}...") # 개발자 확인용
-            else:
-                print(f"[DEBUG] README를 가져오지 못했습니다. (Status: {readme_res.status_code})")
-
-            # 2. 최근 커밋 수집
-            commit_res = await client.get(f"https://api.github.com/repos/{full_name}/commits?per_page=10", headers=HEADERS)
-            
-            commit_messages = []
-            if commit_res.status_code == 200:
-                commit_messages = [c["commit"]["message"] for c in commit_res.json()]
-                print(f"[DEBUG] 최근 커밋 5건:") # 개발자 확인용
-                for i, msg in enumerate(commit_messages, 1):
-                    print(f"  {i}. {msg}")
-            else:
-                print(f"[DEBUG] 커밋 기록을 가져오지 못했습니다. (Status: {commit_res.status_code})")
-
-            collected_data.append({
-                "repo": full_name,
-                "readme": readme_text,
-                "commits": commit_messages
-            })
-            print(f"{'='*50}\n")
-
-        # 수집 완료 후 안내
-        await client.post(response_url, json={
-            "replace_original": True,
-            "text": f"✅ 데이터 수집 완료: {', '.join(d['repo'] for d in collected_data)}\n"
-        })
