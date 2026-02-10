@@ -2,6 +2,7 @@ import json
 import os
 import base64
 import httpx
+import re
 from fastapi import FastAPI, Request, BackgroundTasks
 from dotenv import load_dotenv
 
@@ -18,7 +19,7 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------
-# [Data Ingection]
+# [Data Ingestion]
 # ---------------------------------------------------------
 async def fetch_readme_content(client: httpx.AsyncClient, repo_full_name: str) -> str:
     # 리포지토리 README.md를 수집 및 디코딩
@@ -50,37 +51,19 @@ async def fetch_all_author_commits(client: httpx.AsyncClient, repo_full_name: st
         page+=1
     return commit_messages
 
-async def collect_selected_repo_contents(repo_full_names: list, response_url: str):
-    # 사용자가 선택한 리포지토리들의 데이터를 통합 수집
-    async with httpx.AsyncClient() as client:
-        collected_data = []
-        missing_readme = []
-        
-        for full_name in repo_full_names:
-            # README 수집
-            readme_text = await fetch_readme_content(client, full_name)
-            if not readme_text:
-                missing_readme.append(full_name)
-            # 커밋 메세지 수집
-            commit_logs = await fetch_all_author_commits(client, full_name)
-
-            collected_data.append({
-                "repo": full_name,
-                "readme": readme_text,
-                "raw_commits": commit_logs
-            })
-        # README가 없는 리포지토리 알림
-        if missing_readme:
-            warning_text = "\n".join([f"⚠️ `{repo}` README.md 없음" for repo in missing_readme])
-            await client.port(response_url, json={
-                "replace_original": False,
-                "text": f"알림: 일부 리포지토리의 설명 데이터가 부족할 수 있습니다. \n{warning_text}"
-            })
-        # 수집 완료 알림
-        await client.post(response_url, json={
-            "replace_original": False,
-            "text": f"✅ 데이터 수집 완료 "
-        })
+# ---------------------------------------------------------
+# [Data Preprocessing]
+# ---------------------------------------------------------
+# Noise Filtering
+def filter_noise_msg(messages: list) -> list:
+    noise_patterns = [
+        r"^Merge branch.*", r"^Update README.*", r"^Initial commit.*",
+        r"^fix typo.*", r"^cleanup.*", r"^\."
+    ]
+    return [
+        msg.strip() for msg in messages 
+        if not any(re.match(pattern, msg, re.IGNORECASE) for pattern in noise_patterns)
+    ]
 
 # ---------------------------------------------------------
 # [Slack Interaction Handler]
