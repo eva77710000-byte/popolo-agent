@@ -65,6 +65,15 @@ def filter_noise_msg(messages: list) -> list:
         if not any(re.match(pattern, msg, re.IGNORECASE) for pattern in noise_patterns)
     ]
 
+# Token Optimization
+def optimize_content_size(readme: str, messages: list) -> tuple:
+    # README 상위 2000자, 커밋 최신 50개 제한
+    opt_readme = readme[:2000]
+    opt_msg = messages[:50]
+    return opt_readme, opt_msg
+
+# 
+
 # ---------------------------------------------------------
 # [Slack Interaction Handler]
 # ---------------------------------------------------------
