@@ -72,8 +72,34 @@ def optimize_content_size(readme: str, messages: list) -> tuple:
     opt_msg = messages[:50]
     return opt_readme, opt_msg
 
-# 
+# Text Structuring
+def structure_for_llm(repo_name: str, readme: str, messages: list) -> str:
+    # 단일 테스트로 변환
+    commit_str = "\n".join([f"- {m}" for m in messages])
+    return f"### Project: {repo_name}\n\n[README Snippet]\n{readme}\n\n[Key Commits]\n{commit_str}"
 
+# 데이터 수집 및 전처리 통합
+async def process_data_pipeline(repo_full_names: list, response_url: str):
+    async with httpx.AsyncClient() as client:
+        final_contexts=[]
+
+        for full_name in repo_full_names:
+            # 수집
+            raw_readme = await fetch_readme_content(client, full_name)
+            raw_commits = await fetch_all_author_commits(client, full_name)
+
+            # 전처리
+            filtered_commits = filter_noise_msg(raw_commits)
+            clean_readme, clean_commits = optimize_content_size(raw_readme, filtered_commits)
+            formatted_text = structure_for_llm(full_name, clean_readme, clean_commits)
+
+            final_contexts.append(formatted_text)
+
+        # 결과 전송
+        await client.post(response_url, json={
+            "replace_original": False,
+            "text": f"✅ AI 분석 단계를 시작합니다."
+        })
 # ---------------------------------------------------------
 # [Slack Interaction Handler]
 # ---------------------------------------------------------

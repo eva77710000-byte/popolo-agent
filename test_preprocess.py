@@ -1,4 +1,4 @@
-from main import filter_noise_msg, optimize_content_size# structure_for_llm
+from main import filter_noise_msg, optimize_content_size, structure_for_llm
 
 def run_test():
     print("🚀 데이터 전처리 로직 테스트를 시작합니다.\n")
@@ -26,7 +26,7 @@ def run_test():
     print(f"2. 토큰 최적화 테스트: README 길이({len(clean_readme)}자), 커밋 개수({len(clean_commits)}개)")
     assert len(clean_readme) <= 2000
     print("✅ 토큰 최적화 검증 완료")
-'''
+
     # --- [검증 3: 구조화] ---
     final_output = structure_for_llm("test-repo", clean_readme, clean_commits)
     print("\n3. 최종 구조화 결과 미리보기:")
@@ -35,6 +35,6 @@ def run_test():
     print("-" * 30)
     assert "### Project: test-repo" in final_output
     print("✅ 구조화 검증 완료")
-'''
+
 if __name__ == "__main__":
     run_test()
