@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 import os
@@ -7,6 +8,9 @@ import re
 from datetime import datetime
 from fastapi import FastAPI, Request, BackgroundTasks
 from dotenv import load_dotenv
+
+from agent import PortfolioAgent
+from publisher import build_gallery_table, assemble_full_portfolio, save_to_file
 
 load_dotenv()
 
@@ -24,126 +28,175 @@ HEADERS = {
 # [Error Handling]
 # ---------------------------------------------------------
 async def handle_github_error(res: httpx.Response, response_url: str):
-    # GitHub API 에러 상태
+    """GitHub API 응답에 따른 에러 메시지 생성 및 슬랙 알림"""
     status_code = res.status_code
+    msg = f"🚫 *GitHub API 에러*: 상태 코드 {status_code}가 발생했습니다."
 
     if status_code == 403:
-        # Rate Limit 초과 여부
         remaining = res.headers.get("X-RateLimit-Remaining")
         if remaining == "0":
             reset_time = int(res.headers.get("X-RateLimit-Reset", 0))
             reset_date = datetime.fromtimestamp(reset_time).strftime('%H:%M:%S')
-            msg = f"🚫 *API 호출 한도 초과*: {reset_date}에 제한이 해제됩니다. 잠시 후 다시 시도해주세요."
+            msg = f"🚫 *API 한도 초과*: {reset_date} 이후에 다시 시도해주세요."
         else:
-            msg = "🚫 *권한 거부(403)*: 해당 리포지토리에 접근할 권한이 없습니다. 토큰의 'repo' 권한을 확인해주세요."
-    elif status_code == 401:
-        msg = "🚫 *인증 실패(401)*: GITHUB_TOKEN이 유효하지 않습니다. 설정을 확인해주세요."
-    elif status_code >= 500:
-        msg = "🚫 *GitHub 서버 에러*: GitHub 서비스에 일시적인 장애가 발생했습니다."
-    else:
-        msg = f"❓ *GitHub API 오류*: (Status Code: {status_code})"
-    
+            msg = "🚫 *권한 거부*: 토큰의 'repo' 권한을 확인해주세요."
+    elif status_code == 404:
+        msg = "🚫 *찾을 수 없음*: 리포지토리를 찾을 수 없거나 접근 권한이 없습니다."
+
+    # 슬랙으로 에러 메시지 전송
     async with httpx.AsyncClient() as client:
-        await client.post(response_url, json={"replace_original": False, "text": msg})
+        await client.post(response_url, json={"text": msg, "replace_original": True})
 
 # ---------------------------------------------------------
 # [Data Ingestion]
 # ---------------------------------------------------------
-async def fetch_readme_content(client: httpx.AsyncClient, repo_full_name: str, response_url: str) -> str:
-    # 리포지토리 README.md를 수집 및 디코딩
-    url = f"https://api.github.com/repos/{repo_full_name}/readme"
-    res = await client.get(url, headers=HEADERS)
+async def get_user_id(client: httpx.AsyncClient):
+    """현재 토큰 주인의 GitHub ID를 가져옵니다."""
+    res = await client.get("https://api.github.com/user", headers=HEADERS)
+    return res.json().get("login") if res.status_code == 200 else None
 
-    if res.status_code == 200:
-        content_b64 = res.json().get("content", "")
-        return base64.b64decode(content_b64).decode('utf-8')
+async def fetch_user_raw_data(client: httpx.AsyncClient, repo_full_name: str, user_id: str):
+    """리포지토리에서 원본 README와 사용자 필터링된 커밋 로그를 수집합니다."""
+    commit_url = f"https://api.github.com/repos/{repo_full_name}/commits?author={user_id}&per_page=20"
+    readme_url = f"https://api.github.com/repos/{repo_full_name}/readme"
     
-    if res.status_code != 404:
-        # README가 없는 경우 외의 에러 발생
-        await handle_github_error(res, response_url)
+    commit_res, readme_res = await asyncio.gather(
+        client.get(commit_url, headers=HEADERS),
+        client.get(readme_url, headers=HEADERS)
+    )
+    
+    commits = commit_res.json() if commit_res.status_code == 200 else []
+    readme = readme_res.json() if readme_res.status_code == 200 else {}
+    
+    return commits, readme
 
-    return ""
-
-async def fetch_all_author_commits(client: httpx.AsyncClient, repo_full_name: str, response_url: str) -> list:
-    # 리포지토리에서 사용자가 작성한 모든 커밋 메세지 수집
-    commit_messages = []
-    page = 1
-    while page <=3:
-        url = f"https://api.github.com/repos/{repo_full_name}/commits?per_page=100&page={page}"
-        res = await client.get(url, headers=HEADERS)
-
-        if res.status_code != 200:
-            await handle_github_error(res, response_url)
-            break
-
-        commits = res.json()
-        if not commits:
-            break
-        for c in commits:
-            msg = c.get("commit", {}).get("message", "")
-            if msg:
-                commit_messages.append(msg)
-        page+=1
-    return commit_messages
+async def fetch_user_modified_file_paths(client: httpx.AsyncClient, repo_full_name: str, user_id: str):
+    """사용자가 직접 수정한 파일들의 경로 리스트를 수집합니다."""
+    commits_url = f"https://api.github.com/repos/{repo_full_name}/commits?author={user_id}&per_page=30"
+    res = await client.get(commits_url, headers=HEADERS)
+    
+    paths = set()
+    if res.status_code == 200:
+        for commit in res.json():
+            d_res = await client.get(commit['url'], headers=HEADERS)
+            if d_res.status_code == 200:
+                files = d_res.json().get('files', [])
+                for f in files:
+                    paths.add(f['filename'])
+    return list(paths)
 
 # ---------------------------------------------------------
 # [Data Preprocessing]
 # ---------------------------------------------------------
-def filter_noise_msg(messages: list) -> list:
-    noise_patterns = [
-        r"^Merge branch.*", r"^Update README.*", r"^Initial commit.*",
-        r"^fix typo.*", r"^cleanup.*", r"^\."
-    ]
-    return [
-        msg.strip() for msg in messages 
-        if not any(re.match(pattern, msg, re.IGNORECASE) for pattern in noise_patterns)
-    ]
+def preprocess_commits(commits):
+    """원본 커밋 리스트를 AI 분석용 텍스트로 정제합니다."""
+    return "\n".join([f"- {c['commit']['message']} ({c['commit']['author']['date']})" for c in commits])
 
-def optimize_content_size(readme: str, messages: list) -> tuple:
-    # README 상위 2000자, 커밋 최신 50개 제한
-    opt_readme = readme[:2000]
-    opt_msg = messages[:50]
-    return opt_readme, opt_msg
+def preprocess_readme(readme_data):
+    """Base64 README 데이터를 디코딩하고 텍스트를 최적화합니다."""
+    if not readme_data: return ""
+    content = base64.b64decode(readme_data.get('content', '')).decode('utf-8', errors='ignore')
+    return content[:2000]
 
-def structure_for_llm(repo_name: str, readme: str, messages: list) -> str:
-    # 단일 테스트로 변환
-    commit_str = "\n".join([f"- {m}" for m in messages])
-    return f"### Project: {repo_name}\n\n[README Snippet]\n{readme}\n\n[Key Commits]\n{commit_str}"
+async def extract_user_core_code(client: httpx.AsyncClient, repo_full_name: str, file_paths: list):
+    """수정된 파일 중 핵심 로직을 선별하여 내용을 추출합니다."""
+    target_exts = [".py", ".js", ".ts", ".java", ".go"]
+    priority_keywords = ['main.', 'app.', 'index.', 'agent.', 'service.']
+    
+    core_paths = [
+        p for p in file_paths 
+        if any(p.endswith(ext) for ext in target_exts) and
+        (any(kw in p.lower() for kw in priority_keywords) or "/" not in p)
+    ][:2] # 상위 2개 핵심 파일만
 
-# 데이터 수집 및 전처리 통합
-async def process_data_pipeline(repo_full_names: list, response_url: str):
+    code_segments = []
+    for path in core_paths:
+        f_res = await client.get(f"https://api.github.com/repos/{repo_full_name}/contents/{path}", headers=HEADERS)
+        if f_res.status_code == 200:
+            decoded = base64.b64decode(f_res.json()['content']).decode('utf-8', errors='ignore')
+            code_segments.append(f"--- File: {path} ---\n{decoded[:1500]}")
+    
+    return "\n".join(code_segments)
+
+
+async def process_data_pipeline(selected_repos: list[str], response_url: str):
+    """
+    선택된 리포지토리들에 대해 GitHub 데이터를 수집하고,
+    LangChain 기반 포트폴리오 에이전트로 분석한 뒤,
+    최종 포트폴리오 마크다운을 생성·저장합니다.
+    """
+    if not selected_repos:
+        return
+
+    agent = PortfolioAgent()
+    project_summaries: list[str] = []
+    gallery_repos_info: list[dict] = []
+
     async with httpx.AsyncClient() as client:
-        final_contexts=[]
-        missing_readmes = []
+        user_id = await get_user_id(client)
+        if not user_id:
+            await client.post(
+                response_url,
+                json={"replace_original": False, "text": "🚫 GitHub 사용자 정보를 가져오지 못했습니다. 토큰을 확인해주세요."},
+            )
+            return
 
-        for full_name in repo_full_names:
-            # 수집
-            raw_readme = await fetch_readme_content(client, full_name, response_url)
-            if not raw_readme:
-                missing_readmes.append(full_name)
-            
-            raw_commits = await fetch_all_author_commits(client, full_name, response_url)
+        for repo_full_name in selected_repos:
+            # 1) 원본 데이터 수집
+            commits, readme = await fetch_user_raw_data(client, repo_full_name, user_id)
+            file_paths = await fetch_user_modified_file_paths(client, repo_full_name, user_id)
+            core_code = await extract_user_core_code(client, repo_full_name, file_paths)
 
-            # 전처리
-            filtered_commits = filter_noise_msg(raw_commits)
-            clean_readme, clean_commits = optimize_content_size(raw_readme, filtered_commits)
-            formatted_text = structure_for_llm(full_name, clean_readme, clean_commits)
+            # 2) 전처리
+            commits_text = preprocess_commits(commits)
+            readme_text = preprocess_readme(readme)
 
-            final_contexts.append(formatted_text)
-        
-        # README 부재 알림
-        if missing_readmes:
-            warning_text = "\n".join([f"⚠️'{repo}' README.md 없음" for repo in missing_readmes])
-            await client.post(response_url, json={
-                "replace_original": False,
-                "text": f"일부 리포지토리의 설명 데이터가 부족할 수 있습니다.\n{warning_text}"
-            })
+            context = (
+                f"### Repository: {repo_full_name}\n\n"
+                f"## README (trimmed)\n{readme_text}\n\n"
+                f"## Commit History\n{commits_text}\n\n"
+                f"## Core Code Snippets\n{core_code}\n"
+            )
 
-        # 결과 전송
-        await client.post(response_url, json={
-            "replace_original": False,
-            "text": f"✅ AI 분석 단계를 시작합니다."
-        })
+            # 3) 개별 프로젝트 분석
+            project_summary = await agent.run_analysis(context=context, project_name=repo_full_name)
+            project_summaries.append(project_summary)
+
+            # 갤러리용 메타 정보 (간단 추출)
+            first_line = project_summary.splitlines()[0] if project_summary else repo_full_name
+            gallery_repos_info.append(
+                {
+                    "name": repo_full_name,
+                    "stack": "Auto-detected",  # TODO: LLM 결과에서 스택 추출
+                    "summary": first_line[:120],
+                }
+            )
+
+    if not project_summaries:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                response_url,
+                json={"replace_original": False, "text": "⚠️ 분석 가능한 프로젝트 데이터가 없습니다."},
+            )
+        return
+
+    # 4) 전체 요약 및 포트폴리오 조립
+    overview = await agent.run_total_summary(project_summaries)
+    gallery_table = build_gallery_table(gallery_repos_info)
+    full_portfolio_md = assemble_full_portfolio(overview, gallery_table, project_summaries)
+
+    # 5) 로컬 파일로 저장
+    await save_to_file(full_portfolio_md, filename="PORTFOLIO.md")
+
+    # 6) 슬랙 알림
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            response_url,
+            json={
+                "replace_original": True,
+                "text": "✅ 선택한 리포지토리 기반 포트폴리오 분석이 완료되었습니다.\n로컬 파일 `PORTFOLIO.md`로 저장되었습니다.",
+            },
+        )
 
 # ---------------------------------------------------------
 # [Slack Interaction Handler]
