@@ -16,8 +16,7 @@ load_dotenv()
 
 app = FastAPI(title="POPOLO Agent")
 
-# 분석 대상인 계정의 토큰
-# 이 토큰이 계정의 개인/조직 리포지토리 접근 권한을 결정
+# GitHub Repository(Personal/Org) 접근 권한 인증용 Token
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") 
 HEADERS = {
     "Authorization": f"token {GITHUB_TOKEN}",
@@ -28,7 +27,6 @@ HEADERS = {
 # [Error Handling]
 # ---------------------------------------------------------
 async def handle_github_error(res: httpx.Response, response_url: str):
-    """GitHub API 응답에 따른 에러 메시지 생성 및 슬랙 알림"""
     status_code = res.status_code
     msg = f"🚫 *GitHub API 에러*: 상태 코드 {status_code}가 발생했습니다."
 
@@ -43,7 +41,7 @@ async def handle_github_error(res: httpx.Response, response_url: str):
     elif status_code == 404:
         msg = "🚫 *찾을 수 없음*: 리포지토리를 찾을 수 없거나 접근 권한이 없습니다."
 
-    # 슬랙으로 에러 메시지 전송
+    # Slack 채널로 Error Message 전송
     async with httpx.AsyncClient() as client:
         await client.post(response_url, json={"text": msg, "replace_original": True})
 
@@ -51,12 +49,12 @@ async def handle_github_error(res: httpx.Response, response_url: str):
 # [Data Ingestion]
 # ---------------------------------------------------------
 async def get_user_id(client: httpx.AsyncClient):
-    """현재 토큰 주인의 GitHub ID를 가져옵니다."""
+    # Token Owner의 GitHub ID(Username) 조회 및 반환
     res = await client.get("https://api.github.com/user", headers=HEADERS)
     return res.json().get("login") if res.status_code == 200 else None
 
 async def fetch_user_raw_data(client: httpx.AsyncClient, repo_full_name: str, user_id: str):
-    """리포지토리에서 원본 README와 사용자 필터링된 커밋 로그를 수집합니다."""
+    # Repository 내 원본 README 및 Filtered Commit Log 수집
     commit_url = f"https://api.github.com/repos/{repo_full_name}/commits?author={user_id}&per_page=20"
     readme_url = f"https://api.github.com/repos/{repo_full_name}/readme"
     
@@ -71,7 +69,7 @@ async def fetch_user_raw_data(client: httpx.AsyncClient, repo_full_name: str, us
     return commits, readme
 
 async def fetch_user_modified_file_paths(client: httpx.AsyncClient, repo_full_name: str, user_id: str):
-    """사용자가 직접 수정한 파일들의 경로 리스트를 수집합니다."""
+    # User가 수정한 File Path List 추출 및 수집
     commits_url = f"https://api.github.com/repos/{repo_full_name}/commits?author={user_id}&per_page=30"
     res = await client.get(commits_url, headers=HEADERS)
     
@@ -89,7 +87,7 @@ async def fetch_user_modified_file_paths(client: httpx.AsyncClient, repo_full_na
 # [Data Preprocessing]
 # ---------------------------------------------------------
 async def extract_user_core_code(client: httpx.AsyncClient, repo_full_name: str, file_paths: list):
-    """수정된 파일 중 핵심 로직을 선별하여 내용을 추출합니다."""
+    # 수정된 파일 중 핵심 로직 선별 및 Content 데이터 추출
     target_exts = [".py", ".js", ".ts", ".java", ".go"]
     priority_keywords = ['main.', 'app.', 'index.', 'agent.', 'service.']
     
@@ -97,7 +95,7 @@ async def extract_user_core_code(client: httpx.AsyncClient, repo_full_name: str,
         p for p in file_paths 
         if any(p.endswith(ext) for ext in target_exts) and
         (any(kw in p.lower() for kw in priority_keywords) or "/" not in p)
-    ][:2] # 상위 2개 핵심 파일만
+    ][:2] # 상위 2개
 
     code_segments = []
     for path in core_paths:
@@ -109,7 +107,7 @@ async def extract_user_core_code(client: httpx.AsyncClient, repo_full_name: str,
     return "\n".join(code_segments)
 
 async def process_data_pipeline(selected_repos: list, response_url: str):
-    """실제로 작동하는 전체 분석 및 결과 전송 로직"""
+    # 통합 분석 프로세스 및 결과(Result) 전송 Main 로직 실행
     agent = PortfolioAgent()
     async with httpx.AsyncClient() as client:
         user_id = await get_user_id(client)
@@ -163,9 +161,7 @@ async def process_data_pipeline(selected_repos: list, response_url: str):
                 await client.post(response_url, json={"text": f"⚠️ {repo_name} 분석 중 오류: {e}"})
                 continue
 
-        # 5. 최종 조립 및 전송 (이 구간이 실행되지 않았던 것)
         try:
-            # 전체 요약 생성
             technical_overview = await agent.run_total_summary(project_analyses)
             
             # 갤러리 테이블 및 포트폴리오 조립
@@ -176,7 +172,6 @@ async def process_data_pipeline(selected_repos: list, response_url: str):
                 project_sections=project_analyses
             )
             
-            # 파일 저장 및 슬랙 알림
             await save_to_file(final_portfolio)
             await client.post(response_url, json={
                 "replace_original": False,
@@ -212,7 +207,7 @@ async def handle_slack_interactive(request: Request, background_tasks: Backgroun
     action_id = actions[0].get("action_id")
     response_url = payload.get("response_url")
 
-    # [리포지토리 선택 시] 데이터 수집 단계 (README, Commit 등)
+    # 데이터 수집 단계 (README, Commit 등)
     if action_id == "repo_selection_action":
         selected_repos = [opt["value"] for opt in actions[0].get("selected_options", [])]
         background_tasks.add_task(process_data_pipeline, selected_repos, response_url)
@@ -222,7 +217,7 @@ async def handle_slack_interactive(request: Request, background_tasks: Backgroun
 
 # 리포지토리 목록 호출
 async def fetch_all_integrated_repos(response_url: str):
-    # 개인+조직 리포지토리를 한 번에 쿼리
+    # Personal 및 Organization Repository 통합 쿼리 실행
     api_url = "https://api.github.com/user/repos?sort=updated&per_page=30&affiliation=owner,collaborator,organization_member"
     
     async with httpx.AsyncClient() as client:
@@ -250,7 +245,7 @@ async def fetch_all_integrated_repos(response_url: str):
                     "accessory": {
                         "type": "multi_static_select",
                         "action_id": "repo_selection_action",
-                        "options": options[:25], # 슬랙 드롭다운 최대 한계치 고려
+                        "options": options[:25],
                         "max_selected_items": 5
                     },
                     "text": {"type": "plain_text", "text": "리포지토리 목록"}
